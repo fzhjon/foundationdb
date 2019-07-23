@@ -349,6 +349,10 @@ ACTOR Future<Void> shardSplitter(
 		for( int i = numShards-1; i > skipRange; i-- )
 			restartShardTrackers( self, KeyRangeRef(splitKeys[i], splitKeys[i+1]) );
 
+		// Once a shard on a server (team) is split into k shards, we want to relocate (k-1) shards
+		// while keeping 1 shard on the same server (team).
+		// So, we skip KeyRangeRef( splitKeys[skipRange], splitKeys[skipRange+1] ) for RelocateShard.
+		// However, a shard should always have a tracker. That’s why we do not skip the keyRange in restartShardTrackers above.
 		for( int i = 0; i < skipRange; i++ ) {
 			KeyRangeRef r(splitKeys[i], splitKeys[i+1]);
 			self->shardsAffectedByTeamFailure->defineShard( r );

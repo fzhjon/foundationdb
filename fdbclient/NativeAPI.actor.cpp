@@ -30,6 +30,7 @@
 #include "fdbclient/KeyRangeMap.h"
 #include "fdbclient/Knobs.h"
 #include "fdbclient/ManagementAPI.actor.h"
+#include "fdbclient/md5/md5.h"
 #include "fdbclient/MasterProxyInterface.h"
 #include "fdbclient/MonitorLeader.h"
 #include "fdbclient/MutationList.h"
@@ -562,17 +563,25 @@ DatabaseContext::~DatabaseContext() {
 	for(auto it = server_interf.begin(); it != server_interf.end(); it = server_interf.erase(it))
 		it->second->notifyContextDestroyed();
 	ASSERT_ABORT( server_interf.empty() );
-	locationCache.insert( allKeys, Reference<LocationInfo>() );
+	locationCache.insert( allKeys, ShardData() );
 }
 
 pair<KeyRange,Reference<LocationInfo>> DatabaseContext::getCachedLocation( const KeyRef& key, bool isBackward ) {
 	if( isBackward ) {
 		auto range = locationCache.rangeContainingKeyBefore(key);
-		return std::make_pair(range->range(), range->value());
+		TraceEvent("CacheHit1.0")
+			.detail("ShardBegin", range->range().begin)
+			.detail("ShardEnd", range->range().end)
+			.detail("ShardId", range->value().shardId);
+		return std::make_pair(range->range(), range->value().ssis);
 	}
 	else {
 		auto range = locationCache.rangeContaining(key);
-		return std::make_pair(range->range(), range->value());
+		TraceEvent("CacheHit1.1")
+			.detail("ShardBegin", range->range().begin)
+			.detail("ShardEnd", range->range().end)
+			.detail("ShardId", range->value().shardId);
+		return std::make_pair(range->range(), range->value().ssis);
 	}
 }
 
@@ -584,12 +593,16 @@ bool DatabaseContext::getCachedLocations( const KeyRangeRef& range, vector<std::
 
 	loop {
 		auto r = reverse ? end : begin;
-		if (!r->value()){
+		if (!r->value().ssis){
 			TEST(result.size()); // had some but not all cached locations
 			result.clear();
 			return false;
 		}
-		result.emplace_back(r->range() & range, r->value());
+		TraceEvent("CacheHit2")
+			.detail("ShardBegin", r->range().begin)
+			.detail("ShardEnd", r->range().end)
+			.detail("ShardId", r->value().shardId);
+		result.emplace_back(r->range() & range, r->value().ssis);
 		if (result.size() == limit || begin == end) {
 			break;
 		}
@@ -601,6 +614,27 @@ bool DatabaseContext::getCachedLocations( const KeyRangeRef& range, vector<std::
 	}
 
 	return true;
+}
+std::string createShardId( const KeyRangeRef& keys ) {
+	std::string keyString = std::to_string(keys.begin.size()) + keys.begin.toString() + keys.end.toString();
+	MD5_CTX sum;
+	MD5_Init(&sum);
+	MD5_Update(&sum, keyString.data(), keyString.size());
+	std::string sumBytes;
+	sumBytes.resize(16);
+	MD5_Final((unsigned char *)sumBytes.data(), &sum);
+	std::string contentMD5;
+	contentMD5.reserve(32);
+	for (auto c : sumBytes)
+	{
+		contentMD5.push_back(base16Char(static_cast<unsigned int>(c) / 16));
+		contentMD5.push_back(base16Char(static_cast<unsigned int>(c)));
+	}
+	TraceEvent("ShardIdCreation")
+		.detail("KeyString", keyString)
+		.detail("SumBytes", sumBytes)
+		.detail("ContentMD5", contentMD5);
+	return contentMD5;
 }
 
 Reference<LocationInfo> DatabaseContext::setCachedLocation( const KeyRangeRef& keys, const vector<StorageServerInterface>& servers ) {
@@ -617,23 +651,26 @@ Reference<LocationInfo> DatabaseContext::setCachedLocation( const KeyRangeRef& k
 		attempts++;
 		auto r = locationCache.randomRange();
 		Key begin = r.begin(), end = r.end();  // insert invalidates r, so can't be passed a mere reference into it
-		locationCache.insert( KeyRangeRef(begin, end), Reference<LocationInfo>() );
+		locationCache.insert( KeyRangeRef(begin, end), ShardData() );
 	}
-	locationCache.insert( keys, loc );
+	ShardData shardData;
+	shardData.ssis = loc;
+	shardData.shardId = createShardId(keys);
+	locationCache.insert( keys, shardData );
 	return std::move(loc);
 }
 
 void DatabaseContext::invalidateCache( const KeyRef& key, bool isBackward ) {
 	if( isBackward )
-		locationCache.rangeContainingKeyBefore(key)->value() = Reference<LocationInfo>();
+		locationCache.rangeContainingKeyBefore(key)->value() = ShardData();
 	else
-		locationCache.rangeContaining(key)->value() = Reference<LocationInfo>();
+		locationCache.rangeContaining(key)->value() = ShardData();
 }
 
 void DatabaseContext::invalidateCache( const KeyRangeRef& keys ) {
 	auto rs = locationCache.intersectingRanges(keys);
 	Key begin = rs.begin().begin(), end = rs.end().begin();  // insert invalidates rs, so can't be passed a mere reference into it
-	locationCache.insert( KeyRangeRef(begin, end), Reference<LocationInfo>() );
+	locationCache.insert( KeyRangeRef(begin, end), ShardData() );
 }
 
 Future<Void> DatabaseContext::onMasterProxiesChanged() {
@@ -679,7 +716,7 @@ void DatabaseContext::setOption( FDBDatabaseOptions::Option option, Optional<Str
 				if( clientInfo->get().proxies.size() )
 					masterProxies = Reference<ProxyInfo>( new ProxyInfo( clientInfo->get().proxies, clientLocality ) );
 				server_interf.clear();
-				locationCache.insert( allKeys, Reference<LocationInfo>() );
+				locationCache.insert( allKeys, ShardData() );
 				break;
 			case FDBDatabaseOptions::MAX_WATCHES:
 				maxOutstandingWatches = (int)extractIntOption(value, 0, CLIENT_KNOBS->ABSOLUTE_MAX_WATCHES);
@@ -689,7 +726,7 @@ void DatabaseContext::setOption( FDBDatabaseOptions::Option option, Optional<Str
 				if( clientInfo->get().proxies.size() )
 					masterProxies = Reference<ProxyInfo>( new ProxyInfo( clientInfo->get().proxies, clientLocality ));
 				server_interf.clear();
-				locationCache.insert( allKeys, Reference<LocationInfo>() );
+				locationCache.insert( allKeys, ShardData() );
 				break;
 			case FDBDatabaseOptions::SNAPSHOT_RYW_ENABLE:
 				validateOptionValue(value, false);

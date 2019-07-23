@@ -150,7 +150,12 @@ public:
 
 	// Cache of location information
 	int locationCacheSize;
-	CoalescedKeyRangeMap< Reference<LocationInfo> > locationCache;
+	struct ShardData {
+		std::string shardId;
+		Reference<LocationInfo> ssis;
+		bool operator==(const ShardData &rhs) const { return shardId == rhs.shardId && ssis == rhs.ssis; }
+	};
+	CoalescedKeyRangeMap< ShardData > locationCache;
 
 	std::map< UID, StorageServerInfo* > server_interf;
 
